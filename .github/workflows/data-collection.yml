@@ -21,7 +21,6 @@ jobs:
     - uses: actions/setup-node@v4
       with:
         node-version: 20
-        cache: 'npm'  # Add npm caching for better performance
     - run: npm ci --prefer-offline --no-audit  # Use ci instead of install for reliable dependency installation
     - name: Process symbols batch
       run: node batch_processor.js ${{ github.event.inputs.start_index }} ${{ github.event.inputs.count }}
