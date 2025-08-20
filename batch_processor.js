@@ -25,7 +25,14 @@ async function main() {
         // Load symbols
         const symbolsPath = path.join(__dirname, 'symbols.json');
         const symbolsData = await fs.readFile(symbolsPath, 'utf8');
-        const symbols = JSON.parse(symbolsData);
+        const symbolsFile = JSON.parse(symbolsData);
+        
+        // Extract the symbols array from the file structure
+        const symbols = symbolsFile.symbols || symbolsFile;
+        
+        if (!Array.isArray(symbols)) {
+            throw new Error(`Invalid symbols format. Expected array, got: ${typeof symbols}`);
+        }
         
         console.log(`📊 Total symbols available: ${symbols.length}`);
         
