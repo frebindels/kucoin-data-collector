@@ -7,7 +7,9 @@
   "scripts": {
     "start": "node github_actions_worker.js"
   },
-  "dependencies": {},
+  "dependencies": {
+    "fast-xml-parser": "^5.2.5"
+  },
   "engines": {
     "node": ">=18.0.0"
   },
