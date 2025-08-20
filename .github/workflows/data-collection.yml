@@ -1,0 +1,25 @@
+name: KuCoin Data Collection
+on:
+  workflow_dispatch:
+    inputs:
+      start_index:
+        description: Starting symbol index
+        required: true
+        default: 0
+        type: string
+      count:
+        description: Number of symbols to process
+        required: true
+        default: 100
+        type: string
+
+jobs:
+  collect-data:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 20
+    - run: npm install
+    - run: npm start
