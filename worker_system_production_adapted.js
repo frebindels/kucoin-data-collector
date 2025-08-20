@@ -1,23 +1,24 @@
 #!/usr/bin/env node
 /**
  * KuCoin Data Discovery Worker System - ADAPTED FOR GITHUB ACTIONS
- * Uses working HTML parsing approach with all sophisticated features:
- * - HTML parsing for file discovery (proven to work)
- * - Multiple extraction methods (table, directory, text patterns)
- * - Robust error handling with retries and exponential backoff
+ * Uses working XML endpoint with proper pagination and all sophisticated features:
+ * - XML parsing with max-keys and marker pagination (handles 1000+ files)
+ * - Multiple extraction methods and robust error handling
  * - File validation and duplicate detection
  * - Comprehensive logging and progress tracking
  */
 
+import https from 'https';
+import http from 'http';
 import fs from 'fs/promises';
 import { createWriteStream, unlink } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import https from 'https';
-import http from 'http';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+console.log('🚀 Sophisticated worker starting...');
 
 // Production Configuration
 const WORKER_CONFIG = {
@@ -30,10 +31,9 @@ const WORKER_CONFIG = {
 
 // Paths - adapted for GitHub Actions
 const OUTPUT_DIR = path.join(__dirname, 'worker_output');
-const STATE_FILE = path.join(__dirname, 'worker_progress.json');
 
 // Enhanced logging
-async function log(message, level = 'INFO', context = {}) {
+function log(message, level = 'INFO', context = {}) {
     const timestamp = new Date().toISOString();
     const contextStr = Object.keys(context).length > 0 ? ` [${JSON.stringify(context)}]` : '';
     const logEntry = `[${timestamp}] [${level}] ${message}${contextStr}`;
@@ -45,46 +45,101 @@ async function ensureDir(dir) {
     await fs.mkdir(dir, { recursive: true });
 }
 
-// Working file discovery using HTML parsing (proven approach)
-async function discoverFilesWithHTML(symbol) {
+// Working file discovery using XML endpoint with proper pagination
+async function discoverFilesWithXML(symbol) {
     const files = [];
+    let marker = undefined;
+    let page = 0;
     
     try {
-        // Use the working URL structure that actually returns HTML
-        const url = `https://historical-data.kucoin.com/data/spot/daily/trades/${symbol}/`;
-        await log(`🔍 Discovering files for ${symbol} using HTML parsing...`, 'INFO', { symbol, url });
-        
-        const html = await fetchHTML(url);
-        
-        // Parse HTML to extract file listings - using the working approach
-        const fileMatches = html.match(/href="([^"]*\.zip)"/g);
-        
-        if (fileMatches) {
-            fileMatches.forEach(match => {
-                const filename = match.match(/href="([^"]*\.zip)"/)[1];
-                const fileUrl = `https://historical-data.kucoin.com/data/spot/daily/trades/${symbol}/${filename}`;
-                
-                files.push({
-                    symbol,
-                    filename: filename,
-                    url: fileUrl,
-                    size: 0, // We'll get this from headers if needed
-                    lastModified: new Date().toISOString()
-                });
+        while (true) {
+            page++;
+            const params = new URLSearchParams({ 
+                prefix: `data/spot/daily/trades/${symbol}/`, 
+                'max-keys': '1000' 
             });
+            if (marker) params.set('marker', marker);
+            
+            const url = `https://historical-data.kucoin.com/?${params.toString()}`;
+            log(`Scraping ${symbol} page ${page}`, 'DEBUG', { symbol, page, url });
+            
+            const xml = await fetchXML(url);
+            
+            // Parse XML to extract file listings
+            const keyMatches = xml.match(/<Key>([^<]+)<\/Key>/g);
+            const sizeMatches = xml.match(/<Size>([^<]+)<\/Size>/g);
+            const lastModifiedMatches = xml.match(/<LastModified>([^<]+)<\/LastModified>/g);
+            
+            if (keyMatches) {
+                keyMatches.forEach((keyMatch, index) => {
+                    const key = keyMatch.replace(/<Key>([^<]+)<\/Key>/, '$1');
+                    
+                    // Only process actual zip files (skip checksums and other files)
+                    if (key.endsWith('.zip') && !key.endsWith('.zip.CHECKSUM')) {
+                        const filename = key.split('/').pop();
+                        const size = sizeMatches && sizeMatches[index] 
+                            ? parseInt(sizeMatches[index].replace(/<Size>([^<]+)<\/Size>/, '$1')) 
+                            : 0;
+                        const lastModified = lastModifiedMatches && lastModifiedMatches[index]
+                            ? lastModifiedMatches[index].replace(/<LastModified>([^<]+)<\/LastModified>/, '$1')
+                            : new Date().toISOString();
+                        
+                        files.push({
+                            symbol,
+                            filename: filename,
+                            url: `https://historical-data.kucoin.com/${key}`,
+                            size: size,
+                            lastModified: lastModified
+                        });
+                    }
+                });
+            }
+            
+            log(`Page ${page}: Found ${keyMatches ? keyMatches.length : 0} total keys, ${keyMatches ? keyMatches.filter(k => k.includes('.zip') && !k.includes('.zip.CHECKSUM')).length : 0} zip files`, 'DEBUG', { 
+                symbol, page, totalKeys: keyMatches ? keyMatches.length : 0, zipFiles: keyMatches ? keyMatches.filter(k => k.includes('.zip') && !k.includes('.zip.CHECKSUM')).length : 0 
+            });
+            
+            // Check if more pages exist
+            const isTruncated = xml.includes('<IsTruncated>true</IsTruncated>');
+            if (!isTruncated) {
+                log(`No more pages for ${symbol}`, 'DEBUG', { symbol, page });
+                break;
+            }
+            
+            // Get next marker for pagination
+            const nextMarkerMatch = xml.match(/<NextMarker>([^<]+)<\/NextMarker>/);
+            if (nextMarkerMatch) {
+                marker = nextMarkerMatch[1];
+                log(`Next marker for ${symbol}: ${marker}`, 'DEBUG', { symbol, nextMarker: marker });
+            } else {
+                // If no NextMarker, use the last key as marker
+                if (keyMatches && keyMatches.length > 0) {
+                    const lastKey = keyMatches[keyMatches.length - 1].replace(/<Key>([^<]+)<\/Key>/, '$1');
+                    marker = lastKey;
+                    log(`Using last key as marker for ${symbol}: ${marker}`, 'DEBUG', { symbol, marker });
+                } else {
+                    log(`No more keys and no marker for ${symbol}, stopping pagination`, 'WARN', { symbol, page });
+                    break;
+                }
+            }
+            
+            // Small delay between pages to be respectful
+            await new Promise(resolve => setTimeout(resolve, 100));
         }
         
-        await log(`Successfully discovered ${symbol}: ${files.length} files`, 'INFO', { symbol, fileCount: files.length });
+        log(`Successfully discovered ${symbol}: ${files.length} zip files across ${page} pages`, 'INFO', { 
+            symbol, fileCount: files.length, totalPages: page 
+        });
         return files;
         
     } catch (error) {
-        await log(`Failed to discover ${symbol}: ${error.message}`, 'ERROR', { symbol, error: error.stack });
+        log(`Failed to discover ${symbol}: ${error.message}`, 'ERROR', { symbol, error: error.stack });
         throw error;
     }
 }
 
-// Fetch HTML with retries and exponential backoff
-async function fetchHTML(url, retryCount = 0) {
+// Fetch XML with retries and exponential backoff
+async function fetchXML(url, retryCount = 0) {
     return new Promise((resolve, reject) => {
         const protocol = url.startsWith('https:') ? https : http;
         const request = protocol.get(url, { timeout: WORKER_CONFIG.timeout }, (response) => {
@@ -104,7 +159,7 @@ async function fetchHTML(url, retryCount = 0) {
                     url, retryCount, error: error.stack 
                 });
                 setTimeout(() => {
-                    fetchHTML(url, retryCount + 1).then(resolve).catch(reject);
+                    fetchXML(url, retryCount + 1).then(resolve).catch(reject);
                 }, WORKER_CONFIG.retryDelay * (retryCount + 1)); // Exponential backoff
             } else {
                 reject(error);
@@ -129,7 +184,7 @@ async function downloadFile(file) {
     try {
         const stats = await fs.stat(filePath);
         if (stats.size > 0) {
-            await log(`File already exists: ${file.filename}`, 'INFO', { 
+            log(`File already exists: ${file.filename}`, 'INFO', { 
                 filename: file.filename, 
                 size: stats.size 
             });
@@ -137,7 +192,7 @@ async function downloadFile(file) {
         }
     } catch (error) {
         // File doesn't exist, proceed with download
-        await log(`File doesn't exist, proceeding with download: ${file.filename}`, 'DEBUG', { filename: file.filename });
+        log(`File doesn't exist, proceeding with download: ${file.filename}`, 'DEBUG', { filename: file.filename });
     }
     
     return new Promise((resolve, reject) => {
@@ -186,22 +241,22 @@ async function downloadFile(file) {
 // Main worker function - adapted to skip discovery
 async function runWorker(symbol) {
     try {
-        await log(`🚀 Starting SOPHISTICATED worker for ${symbol}`, 'INFO');
-        await log(`🔗 Run ID: ${process.env.GITHUB_RUN_ID || 'local'}`, 'INFO');
+        log(`🚀 Starting SOPHISTICATED worker for ${symbol}`, 'INFO');
+        log(`🔗 Run ID: ${process.env.GITHUB_RUN_ID || 'local'}`, 'INFO');
         
         // Ensure output directory exists
         await ensureDir(OUTPUT_DIR);
         
-        // Use working HTML parsing for file discovery
-        await log(`🔍 Discovering files for ${symbol} using HTML parsing...`, 'INFO');
-        const files = await discoverFilesWithHTML(symbol);
+        // Use working XML endpoint with proper pagination
+        log(`🔍 Discovering files for ${symbol} using XML endpoint with pagination...`, 'INFO');
+        const files = await discoverFilesWithXML(symbol);
         
         if (files.length === 0) {
-            await log(`No files found for ${symbol}`, 'WARN');
+            log(`No files found for ${symbol}`, 'WARN');
             return;
         }
         
-        await log(`📁 Found ${files.length} files to download`, 'INFO');
+        log(`📁 Found ${files.length} files to download`, 'INFO');
         
         // Download files with sophisticated error handling
         let successCount = 0;
@@ -213,14 +268,14 @@ async function runWorker(symbol) {
                 successCount++;
             } catch (error) {
                 errorCount++;
-                await log(`Failed to download ${file.filename}: ${error.message}`, 'ERROR', { 
+                log(`Failed to download ${file.filename}: ${error.message}`, 'ERROR', { 
                     filename: file.filename, 
                     error: error.stack 
                 });
             }
         }
         
-        await log(`✅ Worker completed for ${symbol}!`, 'INFO', { 
+        log(`✅ Worker completed for ${symbol}!`, 'INFO', { 
             symbol, 
             totalFiles: files.length, 
             successCount, 
@@ -228,7 +283,7 @@ async function runWorker(symbol) {
         });
         
     } catch (error) {
-        await log(`💥 Worker failed for ${symbol}: ${error.message}`, 'ERROR', { 
+        log(`💥 Worker failed for ${symbol}: ${error.message}`, 'ERROR', { 
             symbol, 
             error: error.stack 
         });
@@ -245,10 +300,13 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         process.exit(1);
     }
     
-    runWorker(symbol).catch(error => {
-        log(`Fatal error: ${error.message}`, 'ERROR');
+    console.log('📋 About to call runWorker()...');
+    runWorker(symbol).then(() => {
+        console.log('✅ Worker completed successfully');
+    }).catch(error => {
+        console.error('💥 Worker failed:', error.message);
         process.exit(1);
     });
 }
 
-export { runWorker, discoverFilesWithHTML, downloadFile };
+export { runWorker, discoverFilesWithXML, downloadFile };
