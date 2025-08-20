@@ -5,7 +5,8 @@
   "main": "github_actions_worker.js",
   "type": "module",
   "scripts": {
-    "start": "node github_actions_worker.js"
+    "start": "node github_actions_worker.js",
+    "batch": "node batch_processor.js"
   },
   "dependencies": {
     "fast-xml-parser": "^5.2.5"
