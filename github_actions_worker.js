@@ -120,7 +120,7 @@ async function sendToWebhook(metadata) {
 
 // Discover files for a symbol using the working TURBO approach
 async function discoverFiles(symbol) {
-    const url = `https://historical-data.kucoin.com/data/spot/daily/trades/${symbol}/`;
+    const url = `https://historical-data.kucoin.com/index.html?prefix=data/spot/daily/trades/${symbol}/`;
     
     return new Promise((resolve, reject) => {
         const protocol = url.startsWith('https:') ? https : http;
