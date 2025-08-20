@@ -1,0 +1,15 @@
+{
+  "name": "kucoin-github-actions-worker",
+  "version": "1.0.0",
+  "description": "GitHub Actions KuCoin Data Worker",
+  "main": "github_actions_worker.js",
+  "type": "module",
+  "scripts": {
+    "start": "node github_actions_worker.js"
+  },
+  "dependencies": {},
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "created": "2025-08-20T00:02:33.386Z"
+}
