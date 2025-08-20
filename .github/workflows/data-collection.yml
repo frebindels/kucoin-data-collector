@@ -21,6 +21,7 @@ jobs:
     - uses: actions/setup-node@v4
       with:
         node-version: 20
+        # Removed cache: 'npm' to fix cache issues
     - run: npm ci --prefer-offline --no-audit  # Use ci instead of install for reliable dependency installation
-    - name: Process symbols batch
-      run: node batch_processor.js ${{ github.event.inputs.start_index }} ${{ github.event.inputs.count }}
+    - name: Process symbols batch with sophisticated production worker
+      run: node batch_processor_sophisticated.js ${{ github.event.inputs.start_index }} ${{ github.event.inputs.count }}

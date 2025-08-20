@@ -1,0 +1,18 @@
+{
+  "scrapedSymbols": [],
+  "queuedFiles": [],
+  "downloadedFiles": [],
+  "failedSymbols": [],
+  "failedDownloads": [],
+  "stats": {
+    "symbolsProcessed": 0,
+    "filesQueued": 0,
+    "filesDownloaded": 0,
+    "bytesDownloaded": 0,
+    "errors": 82,
+    "retries": 0
+  },
+  "lastProgressTime": 1755704136701,
+  "lastDownloadedCount": 0,
+  "lastSaved": "2025-08-20T15:41:14.700Z"
+}

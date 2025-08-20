@@ -6,10 +6,16 @@
   "type": "module",
   "scripts": {
     "start": "node github_actions_worker.js",
-    "batch": "node batch_processor.js"
+    "batch": "node batch_processor.js",
+    "production": "node worker_system_production.js",
+    "batch-production": "node batch_processor_production.js",
+    "sophisticated": "node worker_system_production_adapted.js",
+    "batch-sophisticated": "node batch_processor_sophisticated.js"
   },
   "dependencies": {
-    "fast-xml-parser": "^5.2.5"
+    "fast-xml-parser": "^5.2.5",
+    "chalk": "^5.0.0",
+    "ora": "^7.0.0"
   },
   "engines": {
     "node": ">=18.0.0"
