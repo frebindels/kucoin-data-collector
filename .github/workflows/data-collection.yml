@@ -22,6 +22,9 @@ jobs:
       with:
         node-version: 20
         # Removed cache: 'npm' to fix cache issues
-    - run: npm ci --prefer-offline --no-audit  # Use ci instead of install for reliable dependency installation
+    - name: Install dependencies
+      working-directory: ./kucoin-data-collector
+      run: npm ci --prefer-offline --no-audit
     - name: Process symbols batch with sophisticated production worker
+      working-directory: ./kucoin-data-collector
       run: node batch_processor_sophisticated.js ${{ github.event.inputs.start_index }} ${{ github.event.inputs.count }}

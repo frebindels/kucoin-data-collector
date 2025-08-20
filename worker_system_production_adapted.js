@@ -1,10 +1,13 @@
 #!/usr/bin/env node
 /**
  * KuCoin Data Discovery Worker System - ADAPTED FOR GITHUB ACTIONS
- * Uses working XML endpoint with proper pagination and all sophisticated features:
+ * Uses working XML endpoint with proper pagination and FULL PIPELINE:
  * - XML parsing with max-keys and marker pagination (handles 1000+ files)
- * - Multiple extraction methods and robust error handling
- * - File validation and duplicate detection
+ * - Download ZIP + Checksum files
+ * - Verify checksums using MD5
+ * - Validate ZIP integrity
+ * - Extract to CSV
+ * - Validate CSV structure and data quality
  * - Comprehensive logging and progress tracking
  */
 
@@ -14,6 +17,8 @@ import fs from 'fs/promises';
 import { createWriteStream, unlink } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import crypto from 'crypto';
+import AdmZip from 'adm-zip';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -88,6 +93,7 @@ async function discoverFilesWithXML(symbol) {
                             symbol,
                             filename: filename,
                             url: `https://historical-data.kucoin.com/${key}`,
+                            checksumUrl: `https://historical-data.kucoin.com/${key}.CHECKSUM`,
                             size: size,
                             lastModified: lastModified
                         });
@@ -173,31 +179,11 @@ async function fetchXML(url, retryCount = 0) {
     });
 }
 
-// Enhanced download function with comprehensive error handling
-async function downloadFile(file) {
-    const symbolDir = path.join(OUTPUT_DIR, file.symbol);
-    await ensureDir(symbolDir);
-    
-    const filePath = path.join(symbolDir, file.filename);
-    
-    // Check if already downloaded
-    try {
-        const stats = await fs.stat(filePath);
-        if (stats.size > 0) {
-            log(`File already exists: ${file.filename}`, 'INFO', { 
-                filename: file.filename, 
-                size: stats.size 
-            });
-            return true;
-        }
-    } catch (error) {
-        // File doesn't exist, proceed with download
-        log(`File doesn't exist, proceeding with download: ${file.filename}`, 'DEBUG', { filename: file.filename });
-    }
-    
+// Download file with retries
+async function downloadFileWithRetry(url, filePath, retryCount = 0) {
     return new Promise((resolve, reject) => {
-        const protocol = file.url.startsWith('https:') ? https : http;
-        const request = protocol.get(file.url, { timeout: WORKER_CONFIG.timeout }, (response) => {
+        const protocol = url.startsWith('https:') ? https : http;
+        const request = protocol.get(url, { timeout: WORKER_CONFIG.timeout }, (response) => {
             if (response.statusCode !== 200) {
                 reject(new Error(`HTTP ${response.statusCode}: ${response.statusMessage}`));
                 return;
@@ -212,11 +198,7 @@ async function downloadFile(file) {
             
             response.on('end', () => {
                 fileStream.end();
-                log(`Downloaded: ${file.filename} (${(downloadedBytes / 1024).toFixed(1)} KB)`, 'INFO', { 
-                    filename: file.filename, 
-                    size: downloadedBytes 
-                });
-                resolve(true);
+                resolve({ success: true, bytes: downloadedBytes });
             });
             
             response.on('error', (error) => {
@@ -230,7 +212,16 @@ async function downloadFile(file) {
             });
         });
         
-        request.on('error', reject);
+        request.on('error', (error) => {
+            if (retryCount < WORKER_CONFIG.maxRetries) {
+                setTimeout(() => {
+                    downloadFileWithRetry(url, filePath, retryCount + 1).then(resolve).catch(reject);
+                }, WORKER_CONFIG.retryDelay * (retryCount + 1));
+            } else {
+                reject(error);
+            }
+        });
+        
         request.on('timeout', () => {
             request.destroy();
             reject(new Error('Request timeout'));
@@ -238,37 +229,222 @@ async function downloadFile(file) {
     });
 }
 
+// Verify checksum using MD5
+async function verifyChecksum(zipPath, checksumPath) {
+    try {
+        const checksumContent = await fs.readFile(checksumPath, 'utf8');
+        const expectedChecksum = checksumContent.trim().split()[0].toLowerCase();
+        
+        const md5 = crypto.createHash('md5');
+        const zipData = await fs.readFile(zipPath);
+        md5.update(zipData);
+        const actualChecksum = md5.digest('hex').toLowerCase();
+        
+        const isValid = expectedChecksum === actualChecksum;
+        return { 
+            valid: isValid, 
+            expected: expectedChecksum, 
+            actual: actualChecksum,
+            error: isValid ? null : 'Checksum mismatch'
+        };
+    } catch (error) {
+        return { valid: false, error: error.message };
+    }
+}
+
+// Validate ZIP file integrity
+async function validateZipFile(zipPath) {
+    try {
+        const zip = new AdmZip(zipPath);
+        const zipEntries = zip.getEntries();
+        
+        if (zipEntries.length === 0) {
+            return { valid: false, error: 'ZIP file is empty' };
+        }
+        
+        // Check for CSV file
+        const csvEntry = zipEntries.find(entry => entry.entryName.endsWith('.csv'));
+        if (!csvEntry) {
+            return { valid: false, error: 'No CSV file found in ZIP' };
+        }
+        
+        // Try to read CSV content
+        const csvData = zip.readAsText(csvEntry);
+        if (!csvData || csvData.length === 0) {
+            return { valid: false, error: 'CSV content is empty' };
+        }
+        
+        // Check CSV structure
+        const lines = csvData.split('\n').filter(line => line.trim().length > 0);
+        if (lines.length < 2) {
+            return { valid: false, error: 'CSV has insufficient data' };
+        }
+        
+        const header = lines[0];
+        const expectedHeaders = ['trade_id', 'trade_time', 'price', 'size', 'side'];
+        const hasRequiredHeaders = expectedHeaders.every(h => header.toLowerCase().includes(h));
+        
+        if (!hasRequiredHeaders) {
+            return { valid: false, error: 'CSV missing required headers' };
+        }
+        
+        return { 
+            valid: true, 
+            csvSize: csvData.length,
+            csvLines: lines.length,
+            dataRows: lines.length - 1,
+            csvHash: crypto.createHash('md5').update(csvData).digest('hex').toLowerCase()
+        };
+        
+    } catch (error) {
+        return { valid: false, error: `ZIP validation failed: ${error.message}` };
+    }
+}
+
+// Extract ZIP to CSV
+async function extractZipToCsv(zipPath, extractDir) {
+    try {
+        const zip = new AdmZip(zipPath);
+        const zipEntries = zip.getEntries();
+        
+        const csvEntry = zipEntries.find(entry => entry.entryName.endsWith('.csv'));
+        if (!csvEntry) {
+            throw new Error('No CSV file found in ZIP');
+        }
+        
+        const csvFilename = csvEntry.entryName.split('/').pop();
+        const csvPath = path.join(extractDir, csvFilename);
+        
+        // Extract CSV
+        zip.extractEntryTo(csvEntry.entryName, extractDir, false, true);
+        
+        // Verify extraction
+        const extractedData = await fs.readFile(csvPath, 'utf8');
+        const extractedHash = crypto.createHash('md5').update(extractedData).digest('hex').toLowerCase();
+        
+        return { 
+            success: true, 
+            csvPath: csvPath,
+            csvSize: extractedData.length,
+            csvHash: extractedHash
+        };
+        
+    } catch (error) {
+        return { success: false, error: error.message };
+    }
+}
+
+// Full pipeline: Download, verify, validate, extract
+async function processFileComplete(file) {
+    const symbolDir = path.join(OUTPUT_DIR, file.symbol);
+    const extractDir = path.join(symbolDir, 'extracted');
+    await ensureDir(symbolDir);
+    await ensureDir(extractDir);
+    
+    const zipPath = path.join(symbolDir, file.filename);
+    const checksumPath = path.join(symbolDir, file.filename + '.CHECKSUM');
+    
+    try {
+        // Step 1: Download ZIP file
+        log(`Downloading ZIP: ${file.filename}`, 'INFO');
+        const zipResult = await downloadFileWithRetry(file.url, zipPath);
+        log(`Downloaded ZIP: ${file.filename} (${(zipResult.bytes / 1024).toFixed(1)} KB)`, 'INFO');
+        
+        // Step 2: Download checksum file
+        log(`Downloading checksum: ${file.filename}.CHECKSUM`, 'INFO');
+        const checksumResult = await downloadFileWithRetry(file.checksumUrl, checksumPath);
+        log(`Downloaded checksum: ${file.filename}.CHECKSUM`, 'INFO');
+        
+        // Step 3: Verify checksum
+        log(`Verifying checksum: ${file.filename}`, 'INFO');
+        const checksumValidation = await verifyChecksum(zipPath, checksumPath);
+        if (!checksumValidation.valid) {
+            throw new Error(`Checksum verification failed: ${checksumValidation.error}`);
+        }
+        log(`Checksum verified: ${file.filename}`, 'INFO');
+        
+        // Step 4: Validate ZIP integrity
+        log(`Validating ZIP: ${file.filename}`, 'INFO');
+        const zipValidation = await validateZipFile(zipPath);
+        if (!zipValidation.valid) {
+            throw new Error(`ZIP validation failed: ${zipValidation.error}`);
+        }
+        log(`ZIP validated: ${file.filename} (${zipValidation.dataRows} data rows)`, 'INFO');
+        
+        // Step 5: Extract to CSV
+        log(`Extracting to CSV: ${file.filename}`, 'INFO');
+        const extractResult = await extractZipToCsv(zipPath, extractDir);
+        if (!extractResult.success) {
+            throw new Error(`CSV extraction failed: ${extractResult.error}`);
+        }
+        log(`CSV extracted: ${file.filename} -> ${extractResult.csvPath}`, 'INFO');
+        
+        return { 
+            success: true, 
+            filename: file.filename,
+            zipSize: zipResult.bytes,
+            csvSize: extractResult.csvSize,
+            dataRows: zipValidation.dataRows
+        };
+        
+    } catch (error) {
+        // Clean up partial files on error
+        try {
+            if (await fs.access(zipPath).then(() => true).catch(() => false)) {
+                await fs.unlink(zipPath);
+            }
+            if (await fs.access(checksumPath).then(() => true).catch(() => false)) {
+                await fs.unlink(checksumPath);
+            }
+        } catch (cleanupError) {
+            // Ignore cleanup errors
+        }
+        
+        throw error;
+    }
+}
+
 // Main worker function - adapted to skip discovery
 async function runWorker(symbol) {
     try {
+        console.log('🔍 DEBUG: Entering runWorker function');
         log(`🚀 Starting SOPHISTICATED worker for ${symbol}`, 'INFO');
         log(`🔗 Run ID: ${process.env.GITHUB_RUN_ID || 'local'}`, 'INFO');
         
+        console.log('🔍 DEBUG: About to ensure output directory');
         // Ensure output directory exists
         await ensureDir(OUTPUT_DIR);
+        console.log('🔍 DEBUG: Output directory ensured');
         
         // Use working XML endpoint with proper pagination
+        console.log('🔍 DEBUG: About to discover files');
         log(`🔍 Discovering files for ${symbol} using XML endpoint with pagination...`, 'INFO');
         const files = await discoverFilesWithXML(symbol);
+        console.log('🔍 DEBUG: Files discovered, count:', files.length);
         
         if (files.length === 0) {
             log(`No files found for ${symbol}`, 'WARN');
             return;
         }
         
-        log(`📁 Found ${files.length} files to download`, 'INFO');
+        log(`📁 Found ${files.length} files to process`, 'INFO');
         
-        // Download files with sophisticated error handling
+        // Process files with full pipeline
         let successCount = 0;
         let errorCount = 0;
         
         for (const file of files) {
             try {
-                await downloadFile(file);
+                const result = await processFileComplete(file);
                 successCount++;
+                log(`✅ File processed successfully: ${file.filename}`, 'INFO', { 
+                    zipSize: result.zipSize, 
+                    csvSize: result.csvSize, 
+                    dataRows: result.dataRows 
+                });
             } catch (error) {
                 errorCount++;
-                log(`Failed to download ${file.filename}: ${error.message}`, 'ERROR', { 
+                log(`Failed to process ${file.filename}: ${error.message}`, 'ERROR', { 
                     filename: file.filename, 
                     error: error.stack 
                 });
@@ -283,6 +459,8 @@ async function runWorker(symbol) {
         });
         
     } catch (error) {
+        console.error('🔍 DEBUG: Error in runWorker:', error.message);
+        console.error('🔍 DEBUG: Error stack:', error.stack);
         log(`💥 Worker failed for ${symbol}: ${error.message}`, 'ERROR', { 
             symbol, 
             error: error.stack 
@@ -292,8 +470,15 @@ async function runWorker(symbol) {
 }
 
 // Run if called directly
-if (import.meta.url === `file://${process.argv[1]}`) {
+console.log('🔍 DEBUG: Script loaded, checking if run directly');
+console.log('🔍 DEBUG: process.argv[1]:', process.argv[1]);
+console.log('🔍 DEBUG: import.meta.url:', import.meta.url);
+
+if (process.argv[1] && process.argv[1].endsWith('worker_system_production_adapted.js')) {
+    console.log('🔍 DEBUG: Script is being run directly');
     const symbol = process.argv[2];
+    console.log('🔍 DEBUG: Symbol argument:', symbol);
+    
     if (!symbol) {
         console.error('Usage: node worker_system_production_adapted.js <SYMBOL>');
         console.error('Example: node worker_system_production_adapted.js BTCUSDT');
@@ -301,12 +486,17 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     }
     
     console.log('📋 About to call runWorker()...');
+    console.log('🔍 DEBUG: Calling runWorker with symbol:', symbol);
+    
     runWorker(symbol).then(() => {
         console.log('✅ Worker completed successfully');
     }).catch(error => {
         console.error('💥 Worker failed:', error.message);
+        console.error('🔍 DEBUG: Full error:', error);
         process.exit(1);
     });
+} else {
+    console.log('🔍 DEBUG: Script loaded as module, not running directly');
 }
 
-export { runWorker, discoverFilesWithXML, downloadFile };
+export { runWorker, discoverFilesWithXML, processFileComplete };
