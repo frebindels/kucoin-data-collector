@@ -13,7 +13,6 @@
     "batch-sophisticated": "node batch_processor_sophisticated.js"
   },
   "dependencies": {
-    "fast-xml-parser": "^5.2.5",
     "chalk": "^5.0.0",
     "ora": "^7.0.0"
   },

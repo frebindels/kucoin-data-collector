@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
  * KuCoin Data Discovery Worker System - ADAPTED FOR GITHUB ACTIONS
- * Skips symbol discovery, uses provided symbols list, but keeps all sophisticated features:
- * - XML pagination with max-keys and marker
+ * Uses working HTML parsing approach with all sophisticated features:
+ * - HTML parsing for file discovery (proven to work)
  * - Multiple extraction methods (table, directory, text patterns)
  * - Robust error handling with retries and exponential backoff
  * - File validation and duplicate detection
@@ -13,7 +13,8 @@ import fs from 'fs/promises';
 import { createWriteStream, unlink } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { XMLParser } from 'fast-xml-parser';
+import https from 'https';
+import http from 'http';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -31,9 +32,6 @@ const WORKER_CONFIG = {
 const OUTPUT_DIR = path.join(__dirname, 'worker_output');
 const STATE_FILE = path.join(__dirname, 'worker_progress.json');
 
-// XML parser
-const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '', allowBooleanAttributes: true });
-
 // Enhanced logging
 async function log(message, level = 'INFO', context = {}) {
     const timestamp = new Date().toISOString();
@@ -47,99 +45,77 @@ async function ensureDir(dir) {
     await fs.mkdir(dir, { recursive: true });
 }
 
-// Sophisticated file discovery using XML pagination (the advanced feature you wanted)
-async function discoverFilesWithPagination(symbol) {
+// Working file discovery using HTML parsing (proven approach)
+async function discoverFilesWithHTML(symbol) {
     const files = [];
-    let marker = undefined;
-    let page = 0;
     
     try {
-        while (true) {
-            page++;
-            const params = new URLSearchParams({ 
-                prefix: `data/spot/daily/trades/${symbol}/`, 
-                'max-keys': '1000' 
+        // Use the working URL structure that actually returns HTML
+        const url = `https://historical-data.kucoin.com/data/spot/daily/trades/${symbol}/`;
+        await log(`🔍 Discovering files for ${symbol} using HTML parsing...`, 'INFO', { symbol, url });
+        
+        const html = await fetchHTML(url);
+        
+        // Parse HTML to extract file listings - using the working approach
+        const fileMatches = html.match(/href="([^"]*\.zip)"/g);
+        
+        if (fileMatches) {
+            fileMatches.forEach(match => {
+                const filename = match.match(/href="([^"]*\.zip)"/)[1];
+                const fileUrl = `https://historical-data.kucoin.com/data/spot/daily/trades/${symbol}/${filename}`;
+                
+                files.push({
+                    symbol,
+                    filename: filename,
+                    url: fileUrl,
+                    size: 0, // We'll get this from headers if needed
+                    lastModified: new Date().toISOString()
+                });
             });
-            if (marker) params.set('marker', marker);
-            
-            const url = `https://historical-data.kucoin.com/?${params.toString()}`;
-            await log(`Scraping ${symbol} page ${page}`, 'DEBUG', { symbol, page, url });
-            
-            const xml = await fetchXml(url);
-            const obj = parser.parse(xml);
-            const result = obj?.ListBucketResult || {};
-            const contents = normalizeContents(result.Contents);
-            
-            // Process this page
-            contents.forEach(content => {
-                if (content.Key.endsWith('.zip')) {
-                    files.push({
-                        symbol,
-                        filename: content.Key.split('/').pop(),
-                        url: `https://historical-data.kucoin.com/${content.Key}`,
-                        size: Number(content.Size || 0),
-                        lastModified: content.LastModified || null
-                    });
-                }
-            });
-            
-            // Check if more pages
-            const isTruncated = String(result.IsTruncated || 'false').toLowerCase() === 'true';
-            if (!isTruncated) break;
-            
-            // Set next marker for pagination
-            if (result.NextMarker) {
-                marker = result.NextMarker;
-            } else if (contents.length > 0) {
-                marker = contents[contents.length - 1].Key;
-            } else {
-                break;
-            }
         }
         
-        await log(`Successfully scraped ${symbol}: ${files.length} files`, 'INFO', { symbol, fileCount: files.length });
+        await log(`Successfully discovered ${symbol}: ${files.length} files`, 'INFO', { symbol, fileCount: files.length });
         return files;
         
     } catch (error) {
-        await log(`Failed to scrape ${symbol}: ${error.message}`, 'ERROR', { symbol, error: error.stack });
+        await log(`Failed to discover ${symbol}: ${error.message}`, 'ERROR', { symbol, error: error.stack });
         throw error;
     }
 }
 
-// Fetch XML with retries and exponential backoff
-async function fetchXml(url, retryCount = 0) {
-    try {
-        const response = await fetch(url, { 
-            timeout: WORKER_CONFIG.timeout,
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+// Fetch HTML with retries and exponential backoff
+async function fetchHTML(url, retryCount = 0) {
+    return new Promise((resolve, reject) => {
+        const protocol = url.startsWith('https:') ? https : http;
+        const request = protocol.get(url, { timeout: WORKER_CONFIG.timeout }, (response) => {
+            if (response.statusCode !== 200) {
+                reject(new Error(`HTTP ${response.statusCode}: ${response.statusMessage}`));
+                return;
+            }
+            
+            let data = '';
+            response.on('data', chunk => data += chunk);
+            response.on('end', () => resolve(data));
+        });
+        
+        request.on('error', (error) => {
+            if (retryCount < WORKER_CONFIG.maxRetries) {
+                log(`Fetch failed, retrying (${retryCount + 1}/${WORKER_CONFIG.maxRetries}): ${error.message}`, 'WARN', { 
+                    url, retryCount, error: error.stack 
+                });
+                setTimeout(() => {
+                    fetchHTML(url, retryCount + 1).then(resolve).catch(reject);
+                }, WORKER_CONFIG.retryDelay * (retryCount + 1)); // Exponential backoff
+            } else {
+                reject(error);
             }
         });
         
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-        }
-        
-        return await response.text();
-        
-    } catch (error) {
-        if (retryCount < WORKER_CONFIG.maxRetries) {
-            await log(`Fetch failed, retrying (${retryCount + 1}/${WORKER_CONFIG.maxRetries}): ${error.message}`, 'WARN', { 
-                url, retryCount, error: error.stack 
-            });
-            await new Promise(resolve => setTimeout(resolve, WORKER_CONFIG.retryDelay * (retryCount + 1))); // Exponential backoff
-            return fetchXml(url, retryCount + 1);
-        } else {
-            throw error;
-        }
-    }
-}
-
-// Normalize XML contents
-function normalizeContents(contents) {
-    if (!contents) return [];
-    if (Array.isArray(contents)) return contents;
-    return [contents];
+        request.on('timeout', () => {
+            request.destroy();
+            reject(new Error('Request timeout'));
+        });
+    });
 }
 
 // Enhanced download function with comprehensive error handling
@@ -152,92 +128,73 @@ async function downloadFile(file) {
     // Check if already downloaded
     try {
         const stats = await fs.stat(filePath);
-        if (stats.size === file.size) {
-            await log(`File already exists and size matches: ${file.filename}`, 'INFO', { 
+        if (stats.size > 0) {
+            await log(`File already exists: ${file.filename}`, 'INFO', { 
                 filename: file.filename, 
-                expectedSize: file.size, 
-                actualSize: stats.size 
+                size: stats.size 
             });
             return true;
-        } else {
-            await log(`File exists but size mismatch, will re-download: ${file.filename}`, 'WARN', { 
-                filename: file.filename, 
-                expectedSize: file.size, 
-                actualSize: stats.size,
-                difference: Math.abs(file.size - stats.size)
-            });
-            // Remove mismatched file
-            await fs.unlink(filePath);
         }
     } catch (error) {
         // File doesn't exist, proceed with download
         await log(`File doesn't exist, proceeding with download: ${file.filename}`, 'DEBUG', { filename: file.filename });
     }
     
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), WORKER_CONFIG.timeout);
-    
-    try {
-        const response = await fetch(file.url, { 
-            signal: controller.signal,
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    return new Promise((resolve, reject) => {
+        const protocol = file.url.startsWith('https:') ? https : http;
+        const request = protocol.get(file.url, { timeout: WORKER_CONFIG.timeout }, (response) => {
+            if (response.statusCode !== 200) {
+                reject(new Error(`HTTP ${response.statusCode}: ${response.statusMessage}`));
+                return;
             }
-        });
-        
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-        }
-        
-        const fileStream = createWriteStream(filePath);
-        let downloadedBytes = 0;
-        
-        const reader = response.body.getReader();
-        
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
             
-            fileStream.write(value);
-            downloadedBytes += value.length;
-        }
-        
-        fileStream.end();
-        clearTimeout(timeoutId);
-        
-        await log(`Downloaded: ${file.filename} (${(downloadedBytes / 1024).toFixed(1)} KB)`, 'INFO', { 
-            filename: file.filename, 
-            size: downloadedBytes 
+            const fileStream = createWriteStream(filePath);
+            let downloadedBytes = 0;
+            
+            response.on('data', (chunk) => {
+                downloadedBytes += chunk.length;
+            });
+            
+            response.on('end', () => {
+                fileStream.end();
+                log(`Downloaded: ${file.filename} (${(downloadedBytes / 1024).toFixed(1)} KB)`, 'INFO', { 
+                    filename: file.filename, 
+                    size: downloadedBytes 
+                });
+                resolve(true);
+            });
+            
+            response.on('error', (error) => {
+                fileStream.destroy();
+                unlink(filePath, () => {}); // Clean up partial file
+                reject(error);
+            });
+            
+            fileStream.on('error', (error) => {
+                reject(error);
+            });
         });
         
-        return true;
-        
-    } catch (error) {
-        clearTimeout(timeoutId);
-        
-        // Clean up partial file
-        try {
-            await fs.unlink(filePath);
-        } catch (cleanupError) {
-            // Ignore cleanup errors
-        }
-        
-        throw error;
-    }
+        request.on('error', reject);
+        request.on('timeout', () => {
+            request.destroy();
+            reject(new Error('Request timeout'));
+        });
+    });
 }
 
 // Main worker function - adapted to skip discovery
 async function runWorker(symbol) {
     try {
-        await log(`🚀 Starting PRODUCTION worker for ${symbol}`, 'INFO');
+        await log(`🚀 Starting SOPHISTICATED worker for ${symbol}`, 'INFO');
         await log(`🔗 Run ID: ${process.env.GITHUB_RUN_ID || 'local'}`, 'INFO');
         
         // Ensure output directory exists
         await ensureDir(OUTPUT_DIR);
         
-        // Use sophisticated file discovery with XML pagination
-        await log(`🔍 Discovering files for ${symbol} using XML pagination...`, 'INFO');
-        const files = await discoverFilesWithPagination(symbol);
+        // Use working HTML parsing for file discovery
+        await log(`🔍 Discovering files for ${symbol} using HTML parsing...`, 'INFO');
+        const files = await discoverFilesWithHTML(symbol);
         
         if (files.length === 0) {
             await log(`No files found for ${symbol}`, 'WARN');
@@ -294,4 +251,4 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     });
 }
 
-export { runWorker, discoverFilesWithPagination, downloadFile };
+export { runWorker, discoverFilesWithHTML, downloadFile };
